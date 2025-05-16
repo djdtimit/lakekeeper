@@ -393,7 +393,7 @@ async fn serve_inner<A: Authorizer, N: Authenticator + 'static>(
     let stats_handle = tokio::task::spawn(tracker.run());
 
     tokio::select!(
-        _ = queues.spawn_queues::<PostgresCatalog, _, _>(catalog_state, secrets_state, authorizer) => tracing::error!("Tabular queue task failed"),
+        _ = queues.spawn_queues::<PostgresCatalog, _, _>(catalog_state, secrets_state, authorizer, CONFIG.queue_config.poll_interval) => tracing::error!("Tabular queue task failed"),
         err = service_serve(listener, router) => tracing::error!("Service failed: {err:?}"),
         _ = metrics_future => tracing::error!("Metrics server failed"),
     );

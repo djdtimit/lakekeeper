@@ -295,11 +295,12 @@ pub(crate) fn spawn_drop_queues<T: Authorizer>(
     let ctx = ctx.clone();
 
     let queues = TaskQueues::new(Arc::new(
-        PgQueue::from_config(ctx.v1_state.catalog.read_write.clone(), q_config).unwrap(),
+        PgQueue::from_config(ctx.v1_state.catalog.read_write.clone(), q_config.clone()).unwrap(),
     ));
     tokio::task::spawn(queues.spawn_queues::<PostgresCatalog, _, T>(
         ctx.v1_state.catalog.clone(),
         ctx.v1_state.secrets.clone(),
         ctx.v1_state.authz.clone(),
+        q_config.poll_interval,
     ));
 }

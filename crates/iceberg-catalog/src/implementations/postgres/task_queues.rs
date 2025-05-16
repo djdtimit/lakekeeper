@@ -752,6 +752,16 @@ mod test {
         record_success(id2, &pool).await.unwrap();
     }
 
+    fn task_metadata(idempotency_key: Uuid, warehouse_id: WarehouseId) -> TaskMetadata {
+        TaskMetadata {
+            tabular_id: None,
+            idempotency_key,
+            warehouse_id,
+            parent_task_id: None,
+            suspend_until: None,
+        }
+    }
+
     #[sqlx::test]
     async fn test_queue_batch_idempotency(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -764,23 +774,11 @@ mod test {
             "test",
             vec![
                 TaskInput {
-                    task_metadata: TaskMetadata {
-                        tabular_id: None,
-                        idempotency_key: idp1,
-                        warehouse_id,
-                        parent_task_id: None,
-                        suspend_until: None,
-                    },
+                    task_metadata: task_metadata(idp1, warehouse_id),
                     payload: serde_json::Value::default(),
                 },
                 TaskInput {
-                    task_metadata: TaskMetadata {
-                        tabular_id: None,
-                        idempotency_key: idp2,
-                        warehouse_id,
-                        parent_task_id: None,
-                        suspend_until: None,
-                    },
+                    task_metadata: task_metadata(idp2, warehouse_id),
                     payload: serde_json::Value::default(),
                 },
             ],
@@ -821,46 +819,66 @@ mod test {
         assert!(task2.task_metadata.parent_task_id.is_none());
         assert_eq!(&task2.queue_name, "test");
 
-        record_success(task.task_id, &pool).await.unwrap();
-        record_success(id2, &pool).await.unwrap();
+        // Re-insert the first task with the same idempotency key
+        // and a new idempotency key
+        // This should create a new task with the new idempotency key
         let new_key = Uuid::now_v7();
         let ids_second = queue_task_batch(
             &mut conn,
             "test",
             vec![
                 TaskInput {
-                    task_metadata: TaskMetadata {
-                        tabular_id: None,
-                        idempotency_key: idp1,
-                        warehouse_id,
-                        parent_task_id: None,
-                        suspend_until: None,
-                    },
+                    task_metadata: task_metadata(idp1, warehouse_id),
                     payload: serde_json::Value::default(),
                 },
                 TaskInput {
-                    task_metadata: TaskMetadata {
-                        tabular_id: None,
-                        idempotency_key: new_key,
-                        warehouse_id,
-                        parent_task_id: None,
-                        suspend_until: None,
-                    },
+                    task_metadata: task_metadata(new_key, warehouse_id),
                     payload: serde_json::Value::default(),
                 },
             ],
         )
         .await
         .unwrap();
-        assert_eq!(ids_second.len(), 1);
-        let id = ids_second[0].task_id;
-        let idempotency_key = ids_second[0].idempotency_key;
-        assert_eq!(idempotency_key, new_key);
+        let new_id = ids_second[0].task_id;
 
+        assert_eq!(ids_second.len(), 1);
+        assert_eq!(ids_second[0].idempotency_key, new_key);
+
+        // move both old tasks to done which will clear them from task table and move them into
+        // task_log
+        record_success(id, &pool).await.unwrap();
+        record_success(id2, &pool).await.unwrap();
+
+        // Re-insert two tasks with previously used idempotency keys
+        let ids_third = queue_task_batch(
+            &mut conn,
+            "test",
+            vec![TaskInput {
+                task_metadata: task_metadata(idp1, warehouse_id),
+                payload: serde_json::Value::default(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_third.len(), 1);
+        let id = ids_third[0].task_id;
+        assert_eq!(ids_third[0].idempotency_key, idp1);
+        record_success(id, &pool).await.unwrap();
+
+        // pick one new task, one re-inserted task
         let task = pick_task(&pool, "test", &queue.max_age)
             .await
             .unwrap()
             .unwrap();
+
+        assert_eq!(task.task_id, new_id);
+        assert_eq!(task.task_metadata.idempotency_key, new_key);
+        assert!(matches!(task.status, TaskStatus::Running));
+        assert_eq!(task.attempt, 1);
+        assert!(task.picked_up_at.is_some());
+        assert!(task.task_metadata.parent_task_id.is_none());
+        assert_eq!(&task.queue_name, "test");
 
         assert!(
             pick_task(&pool, "test", &queue.max_age)
@@ -869,13 +887,6 @@ mod test {
                 .is_none(),
             "There should be no tasks left, something is wrong."
         );
-
-        assert_eq!(task.task_id, id);
-        assert!(matches!(task.status, TaskStatus::Running));
-        assert_eq!(task.attempt, 1);
-        assert!(task.picked_up_at.is_some());
-        assert!(task.task_metadata.parent_task_id.is_none());
-        assert_eq!(&task.queue_name, "test");
 
         record_success(task.task_id, &pool).await.unwrap();
     }

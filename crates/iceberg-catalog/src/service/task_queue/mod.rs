@@ -79,7 +79,7 @@ impl TaskQueues {
             .insert(queue_name, RegisteredQueue { config, queue_task });
     }
 
-    async fn run(self) {
+    async fn run(self, poll_interval: tokio::time::Duration) {
         loop {
             for (queue_name, queue_tx) in &self.queues {
                 // Todo: error handling
@@ -104,11 +104,11 @@ impl TaskQueues {
                     };
                 }
             }
-            tokio::time::sleep(CONFIG.queue_config.poll_interval).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
-    async fn outer_run(mut self) -> anyhow::Result<()> {
+    async fn outer_run(mut self, poll_interval: Duration) -> anyhow::Result<()> {
         let mut queue_tasks = vec![];
         let mut qs = HashMap::with_capacity(0);
         std::mem::swap(&mut self.registered_queues, &mut qs);
@@ -132,7 +132,7 @@ impl TaskQueues {
             }
             self.queues.insert(name, tx);
         }
-        let feeder = tokio::task::spawn(self.run());
+        let feeder = tokio::task::spawn(self.run(poll_interval));
         tokio::select! {
             res = futures::future::select_all(queue_tasks) => {
                 let (res, index, _) = res;
@@ -162,6 +162,7 @@ impl TaskQueues {
         catalog_state: C::State,
         secret_store: S,
         authorizer: A,
+        poll_interval: Duration,
     ) -> Result<(), anyhow::Error>
     where
         C: Catalog,
@@ -215,7 +216,7 @@ impl TaskQueues {
                 .boxed()
             }),
         );
-        self.outer_run().await?;
+        self.outer_run(poll_interval).await?;
         Ok(())
     }
 }
@@ -420,6 +421,9 @@ const fn valid_max_age(num: i64) -> chrono::Duration {
 mod test {
     use std::sync::Arc;
 
+    use sqlx::PgPool;
+    use tracing_test::traced_test;
+
     use crate::{
         api::{
             iceberg::v1::PaginationQuery,
@@ -439,8 +443,6 @@ mod test {
             Catalog, ListFlags, Transaction,
         },
     };
-    use sqlx::PgPool;
-    use tracing_test::traced_test;
 
     // #[cfg(feature = "sqlx-postgres")]
     #[sqlx::test]
@@ -467,7 +469,12 @@ mod test {
         let sec = secrets.clone();
         let auth = AllowAllAuthorizer;
         let _queue_task = tokio::task::spawn(
-            queues.spawn_queues::<PostgresCatalog, _, AllowAllAuthorizer>(cat, sec, auth),
+            queues.spawn_queues::<PostgresCatalog, _, AllowAllAuthorizer>(
+                cat,
+                sec,
+                auth,
+                std::time::Duration::from_millis(100),
+            ),
         );
 
         let warehouse = initialize_warehouse(
