@@ -420,8 +420,6 @@ const fn valid_max_age(num: i64) -> chrono::Duration {
 mod test {
     use std::sync::Arc;
 
-    use sqlx::PgPool;
-
     use crate::{
         api::{
             iceberg::v1::PaginationQuery,
@@ -441,9 +439,12 @@ mod test {
             Catalog, ListFlags, Transaction,
         },
     };
+    use sqlx::PgPool;
+    use tracing_test::traced_test;
 
     // #[cfg(feature = "sqlx-postgres")]
     #[sqlx::test]
+    #[traced_test]
     async fn test_queue_expiration_queue_task(pool: PgPool) {
         let config = TaskQueueConfig {
             max_retries: 5,

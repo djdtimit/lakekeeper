@@ -163,33 +163,6 @@ pub(crate) async fn queue_task_batch(
     .map_err(|e| e.into_error_model("failed queueing tasks"))?)
 }
 
-async fn record_failure(
-    conn: &PgPool,
-    id: Uuid,
-    n_retries: i32,
-    details: &str,
-) -> Result<(), IcebergErrorResponse> {
-    let _ = sqlx::query!(
-        r#"
-        WITH cte as (
-            SELECT attempt >= $2 as should_fail
-            FROM task
-            WHERE task_id = $1
-        )
-        UPDATE task
-        SET status = CASE WHEN (select should_fail from cte) THEN 'failed'::task_status ELSE 'pending'::task_status END,
-            last_error_details = $3
-        WHERE task_id = $1
-        "#,
-        id,
-        n_retries,
-        details
-    )
-        .execute(conn)
-        .await.map_err(|e| e.into_error_model("failed to record task failure"))?;
-    Ok(())
-}
-
 #[tracing::instrument]
 async fn pick_task(
     pool: &PgPool,
@@ -248,8 +221,11 @@ r#" WITH updated_task AS (
 async fn record_success(id: Uuid, pool: &PgPool) -> Result<(), IcebergErrorResponse> {
     let _ = sqlx::query!(
         r#"
-        UPDATE task
-        SET status = 'done'
+        WITH history as (
+            INSERT INTO task_log(task_id, warehouse_id, queue_name, state, status)
+                SELECT task_id, warehouse_id, queue_name, state, 'done' FROM task
+                                                                        WHERE task_id = $1)
+        DELETE FROM task
         WHERE task_id = $1
         "#,
         id
@@ -257,6 +233,61 @@ async fn record_success(id: Uuid, pool: &PgPool) -> Result<(), IcebergErrorRespo
     .execute(pool)
     .await
     .map_err(|e| e.into_error_model("failed to record task success"))?;
+    Ok(())
+}
+
+async fn record_failure(
+    conn: &PgPool,
+    id: Uuid,
+    n_retries: i32,
+    details: &str,
+) -> Result<(), IcebergErrorResponse> {
+    let should_fail = sqlx::query_scalar!(
+        r#"
+        SELECT attempt >= $1 as "should_fail!"
+        FROM task
+        WHERE task_id = $2
+        "#,
+        n_retries,
+        id
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| e.into_error_model("failed to check if task should fail"))?
+    .unwrap_or(false);
+
+    if should_fail {
+        sqlx::query!(
+            r#"
+            WITH history as (
+                INSERT INTO task_log(task_id, warehouse_id, queue_name, state, status)
+                SELECT task_id, warehouse_id, queue_name, state, 'failed'
+                FROM task WHERE task_id = $1
+            )
+            DELETE FROM task
+            WHERE task_id = $1
+            "#,
+            id
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| e.into_error_model("failed to log and delete failed task"))?;
+    } else {
+        sqlx::query!(
+            r#"
+            UPDATE task
+            SET status = 'pending',
+                last_error_details = $2
+            WHERE task_id = $1
+            "#,
+            id,
+            details
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| e.into_error_model("failed to update task status"))?;
+    }
+
     Ok(())
 }
 
@@ -272,11 +303,14 @@ pub(crate) async fn cancel_pending_tasks(
     match filter {
         TaskFilter::WarehouseId(warehouse_id) => {
             sqlx::query!(
-                r#"
-                    UPDATE task SET status = 'cancelled'
-                    WHERE status = 'pending'
-                    AND warehouse_id = $1
-                    AND queue_name = $2
+                r#"WITH log as (
+                        INSERT INTO task_log(task_id, warehouse_id, queue_name, state, status)
+                        SELECT task_id, warehouse_id, queue_name, state, 'cancelled'
+                        FROM task
+                        WHERE status = 'pending' AND warehouse_id = $1 AND queue_name = $2
+                    )
+                    DELETE FROM task
+                    WHERE status = 'pending' AND warehouse_id = $1 AND queue_name = $2
                 "#,
                 *warehouse_id,
                 queue_name
@@ -295,8 +329,13 @@ pub(crate) async fn cancel_pending_tasks(
         }
         TaskFilter::TaskIds(task_ids) => {
             sqlx::query!(
-                r#"
-                    UPDATE task SET status = 'cancelled'
+                r#"WITH log as (
+                        INSERT INTO task_log(task_id, warehouse_id, queue_name, state, status)
+                        SELECT task_id, warehouse_id, queue_name, state, 'cancelled'
+                        FROM task
+                        WHERE status = 'pending' AND task_id = ANY($1)
+                    )
+                    DELETE FROM task
                     WHERE status = 'pending'
                     AND task_id = ANY($1)
                 "#,

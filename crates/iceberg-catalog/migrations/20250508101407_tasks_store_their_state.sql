@@ -40,3 +40,28 @@ create table task_config
     config       jsonb                                                      not null,
     primary key (warehouse_id, queue_name)
 );
+
+
+create table task_log
+(
+    task_id            uuid primary key                                           not null,
+    warehouse_id       uuid references warehouse (warehouse_id) on delete cascade not null,
+    queue_name         text                                                       not null,
+    state              jsonb                                                      not null,
+    status             task_status                                                not null,
+    last_error_details text
+);
+
+insert into task_log (task_id, warehouse_id, queue_name, state, status, last_error_details)
+select task.task_id,
+       task.warehouse_id,
+       task.queue_name,
+       task.state,
+       task.status,
+       task.last_error_details
+from task
+where status != any ('{running, pending}');
+
+DELETE
+FROM task
+WHERE status != any ('{running, pending}');
