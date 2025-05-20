@@ -106,24 +106,58 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
                     let (ids, idents, tokens): (Vec<_>, Vec<_>, Vec<_>) =
                         list_namespaces.into_iter_with_page_tokens().multiunzip();
 
+                    let can_list_all = if let Some(parent) = &parent {
+                        // We're inside a sub-namespace: check on namespace
+                        let namespace_id = C::namespace_to_id(warehouse_id, parent.as_ref(), t.transaction()).await?.expect("Namespace ID must exist after authorization");
+                        authorizer
+                            .is_allowed_namespace_action(
+                                &request_metadata,
+                                namespace_id,
+                                CatalogNamespaceAction::CanListEverythingInNamespace, // <--- Add this variant
+                            )
+                            .await?
+                    } else {
+                        // We're listing top-level namespaces: check on warehouse
+                        authorizer
+                            .is_allowed_warehouse_action(
+                                &request_metadata,
+                                warehouse_id,
+                                CatalogWarehouseAction::CanListEverythingInNamespace, // <--- Add this variant
+                            )
+                            .await?
+                    };
+
+
                     let (next_namespaces, next_uuids, next_page_tokens, mask): (
-                        Vec<_>,
-                        Vec<_>,
-                        Vec<_>,
-                        Vec<bool>,
-                    ) = futures::future::try_join_all(ids.iter().map(|n| {
-                        authorizer.is_allowed_namespace_action(
-                            &request_metadata,
-                            *n,
-                            CatalogNamespaceAction::CanGetMetadata,
-                        )
-                    }))
-                    .await?
-                    .into_iter()
-                    .zip(idents.into_iter().zip(ids.into_iter()))
-                    .zip(tokens.into_iter())
-                    .map(|((allowed, namespace), token)| (namespace.0, namespace.1, token, allowed))
-                    .multiunzip();
+    Vec<_>,
+    Vec<_>,
+    Vec<_>,
+    Vec<bool>,
+) = if can_list_all {
+    // Fast path: allow all
+    idents
+        .into_iter()
+        .zip(ids.into_iter())
+        .zip(tokens.into_iter())
+        .map(|((namespace, id), token)| (namespace.namespace_ident, id, token, true))
+        .multiunzip()
+} else {
+    // Fall back to filtered per-entry checks
+    futures::future::try_join_all(ids.iter().map(|n| {
+        authorizer.is_allowed_namespace_action(
+            &request_metadata,
+            *n,
+            CatalogNamespaceAction::CanGetMetadata,
+        )
+    }))
+    .await?
+    .into_iter()
+    .zip(idents.into_iter().zip(ids.into_iter()))
+    .zip(tokens.into_iter())
+    .map(|((allowed, namespace), token)| (namespace.namespace_ident, namespace.1, token, allowed))
+    .multiunzip()
+};
+
 
                     Ok(UnfilteredPage::new(
                         next_namespaces,
